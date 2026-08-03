@@ -1,0 +1,344 @@
+<!--
+  VERSÃO 2 — Formulário de captura + rastreamento, injetado no WordPress.
+
+  Diferença em relação à versão 1 (GTM): além da origem, captura dados
+  estruturados do lead (nome, email, empresa, telefone, interesse) antes de
+  mandar para o WhatsApp. O envio vai para /wp-json/leadproxy/v1/lead, o proxy
+  server-side (ver proxy-lead.php). O front não carrega nenhum segredo.
+
+  Sanitizado: número de WhatsApp, domínio e link de política são placeholders.
+
+  Ajustes de lógica em relação ao código original de produção:
+  - mostrarErro() é definida ANTES de qualquer validação que a use.
+  - A decisão de enviar usa uma flag booleana, não o estilo CSS do balão de erro.
+    (No original, o envio dependia de getComputedStyle(...).display, o que
+    acoplava a lógica de dados à renderização e podia bloquear envios legítimos
+    quando um erro anterior ainda estava visível pelo timeout.)
+  - Removida a duplicação do if de "interesse principal".
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* === BOTÃO E FORMULÁRIO === */
+  #botao-flutuante {
+    position: fixed; bottom: 20px; right: 20px; width: 60px; height: 60px;
+    background: #25d366 url('https://upload.wikimedia.org/wikipedia/commons/5/5e/WhatsApp_icon.png') no-repeat center;
+    background-size: 60%; border-radius: 50%; cursor: pointer; z-index: 9999;
+  }
+  #overlay {
+    display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.5); z-index: 9998;
+  }
+  #whatsapp-form-container {
+    display: none; position: fixed; bottom: 70px; right: 20px; width: 320px;
+    max-height: 85vh; background-color: #e5ddd5; border-radius: 8px 8px 0 0;
+    box-shadow: 0 0 10px rgba(0,0,0,0.3); flex-direction: column; z-index: 9999; overflow: visible;
+  }
+  #chat-header {
+    background-color: #075e54; color: white; padding: 12px; font-weight: bold;
+    font-size: 16px; position: relative;
+  }
+  #fechar-formulario {
+    position: absolute; top: 8px; right: 12px; font-size: 18px; color: white;
+    cursor: pointer; font-weight: bold;
+  }
+  #chat-body { margin-left: 8px; padding: 8px; background-color: #e5ddd5; }
+  .message {
+    background-color: #dcf8c6; padding: 2px 12px; border-radius: 8px; margin-bottom: 0px;
+    max-width: 80%; align-self: flex-end; font-size: 14px;
+  }
+  #chat-input { display: flex; flex-direction: column; padding: 10px; background-color: #e5ddd5; }
+  #chat-input input, #chat-input label { margin-bottom: 6px; font-size: 14px; }
+  #chat-input input[type="text"], #chat-input input[type="email"], #chat-input input[type="tel"] {
+    padding: 7px; border: none; border-radius: 18px; outline: none; font-size: 14px; width: 100%; box-sizing: border-box;
+  }
+  #chat-input button {
+    background-color: #25d366; border: none; color: white; padding: 8px; border-radius: 18px; cursor: pointer; font-weight: bold; font-size: 20px;
+  }
+  #pergunta { font-weight: bold; padding: 8px; }
+  #texto-de-privacidade {
+    font-weight: lighter; font-size: x-small; padding: 1px; background-color: #e5ddd5;
+    text-align: center; margin-bottom: 0; padding-bottom: 0;
+  }
+  #texto-de-privacidade a { font-size: x-small; color: #555555; }
+  #texto-de-privacidade a:hover { font-size: x-small; color: #000000; }
+  #chat-input select {
+    padding: 7px; border: none; border-radius: 18px; outline: none; font-size: 14px;
+    width: 100%; box-sizing: border-box; background-color: white; margin-bottom: 6px;
+  }
+  /* Mobile até 800px */
+  @media (max-width: 800px) {
+    body.modal-open { overflow: hidden; height: 100vh; }
+    #whatsapp-form-container {
+      width: 90%; left: auto; right: 5%; top: auto; bottom: 80px; margin-top: 10px;
+      position: fixed; max-height: calc(100vh - 100px); overflow-y: auto;
+      border-radius: 10px; height: fit-content;
+    }
+    #chat-body .message, #chat-input input, #chat-input label { font-size: 12px; padding: 1px; }
+    #chat-input .linha-flex { display: flex; gap: 8px; width: 100%; }
+    #chat-input .linha-flex input { flex: 1; min-width: 0; margin-bottom: 6px; }
+  }
+  /* Notebooks até 1400px: esconde o balão */
+  @media (max-width: 1400px) and (min-width: 801px) {
+    #chat-body .message { display: none; }
+  }
+  #form-error {
+    display: none; background: #ffdddd; color: #b30000; padding: 8px; font-size: 13px;
+    text-align: center; border-radius: 6px; margin: 4px 8px 6px; border: 1px solid #ff9090;
+  }
+</style>
+
+<div id="botao-flutuante" title="Abrir WhatsApp"></div>
+<div id="overlay"></div>
+
+<div id="whatsapp-form-container">
+  <div id="chat-header">Atendimento WhatsApp <span id="fechar-formulario">&times;</span></div>
+  <div id="chat-body"><div class="message">Olá! Preencha seus dados para iniciarmos o atendimento 😊</div></div>
+  <form id="lead-form">
+    <div id="chat-input">
+      <input id="whatsnome" type="text" name="nome" placeholder="Seu nome" required />
+      <input id="whatsemail" type="email" name="email" placeholder="Seu email" required />
+      <div class="linha-flex">
+        <input id="whatstel" type="tel" name="telefone" placeholder="Seu telefone" required />
+        <input type="text" name="empresa" placeholder="Empresa" required />
+      </div>
+      <select name="interesse_principal" required>
+        <option value="" disabled selected>Selecione o que está buscando</option>
+        <option value="Opção A">Opção A</option>
+        <option value="Opção B">Opção B</option>
+        <option value="Outros assuntos">Outros assuntos</option>
+      </select>
+      <button id="botao" type="submit">Enviar</button>
+      <div id="form-error"></div>
+      <div id="texto-de-privacidade">Ao enviar você declara que leu e concorda com os
+        <span><a href="https://SEU-DOMINIO.exemplo.com.br/politica-de-privacidade/">Termos de Uso e a Política de Privacidade</a></span>.
+      </div>
+    </div>
+  </form>
+</div>
+
+<script>
+(function () {
+  // ===== Helpers de storage =====
+  function setCookie(name, value, minutes) {
+    var expires = new Date(Date.now() + minutes * 60 * 1000).toUTCString();
+    document.cookie = name + "=" + encodeURIComponent(value) + "; expires=" + expires + "; path=/";
+  }
+  function getCookie(name) {
+    var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return match ? decodeURIComponent(match[2]) : null;
+  }
+
+  // ===== Armazena UTMs só no primeiro acesso, com expiração de 30 min =====
+  function storeUTMs() {
+    var agora = Date.now();
+    var params = new URLSearchParams(window.location.search);
+    var utms = ['utm_source','utm_medium','utm_campaign','utm_term','utm_content','gclid','fbclid'];
+
+    utms.forEach(function (key) {
+      var value = params.get(key);
+      var jaExiste = sessionStorage.getItem(key) || localStorage.getItem(key) || getCookie(key);
+      if (!jaExiste && value) {
+        try {
+          sessionStorage.setItem(key, value);
+          sessionStorage.setItem(key + '_timestamp', agora);
+        } catch (e1) {
+          try {
+            localStorage.setItem(key, value);
+            localStorage.setItem(key + '_timestamp', agora);
+          } catch (e2) {
+            setCookie(key, value, 30);
+          }
+        }
+      }
+    });
+
+    var jaTemReferer = sessionStorage.getItem('referer') || localStorage.getItem('referer') || getCookie('referer');
+    if (!jaTemReferer && document.referrer) {
+      var sameDomain = location.hostname && document.referrer.indexOf(location.hostname) !== -1;
+      if (!sameDomain) {
+        try {
+          sessionStorage.setItem('referer', document.referrer);
+          sessionStorage.setItem('referer_timestamp', agora);
+        } catch (e1) {
+          try {
+            localStorage.setItem('referer', document.referrer);
+            localStorage.setItem('referer_timestamp', agora);
+          } catch (e2) {
+            setCookie('referer', document.referrer, 30);
+          }
+        }
+      }
+    }
+  }
+  storeUTMs();
+
+  // ===== Recupera UTMs respeitando a expiração =====
+  function getUTMParams() {
+    var EXPIRACAO_MS = 30 * 60 * 1000;
+    var agora = Date.now();
+    var utms = ['utm_source','utm_medium','utm_campaign','utm_term','utm_content','gclid','fbclid'];
+    var result = {};
+
+    utms.forEach(function (key) {
+      var value = '';
+      try {
+        var ts = parseInt(sessionStorage.getItem(key + '_timestamp'), 10);
+        if (ts && agora - ts < EXPIRACAO_MS) {
+          value = sessionStorage.getItem(key);
+        } else {
+          var tls = parseInt(localStorage.getItem(key + '_timestamp'), 10);
+          if (tls && agora - tls < EXPIRACAO_MS) {
+            value = localStorage.getItem(key);
+          } else {
+            value = getCookie(key) || '';
+          }
+        }
+      } catch (e) {
+        value = getCookie(key) || '';
+      }
+      result[key] = value;
+    });
+
+    var referer = '';
+    try {
+      var tsRef = parseInt(sessionStorage.getItem('referer_timestamp'), 10);
+      if (tsRef && agora - tsRef < EXPIRACAO_MS) {
+        referer = sessionStorage.getItem('referer');
+      } else {
+        var tlsRef = parseInt(localStorage.getItem('referer_timestamp'), 10);
+        if (tlsRef && agora - tlsRef < EXPIRACAO_MS) {
+          referer = localStorage.getItem('referer');
+        } else {
+          referer = getCookie('referer') || '';
+        }
+      }
+    } catch (e) {
+      referer = getCookie('referer') || '';
+    }
+    result.referer = referer;
+    return result;
+  }
+
+  // ===== Abrir/fechar modal =====
+  var botao = document.getElementById('botao-flutuante');
+  var container = document.getElementById('whatsapp-form-container');
+  var fechar = document.getElementById('fechar-formulario');
+  var overlay = document.getElementById('overlay');
+
+  if (botao) {
+    botao.addEventListener('click', function () {
+      container.style.display = 'flex';
+      container.style.flexDirection = 'column';
+      overlay.style.display = 'block';
+      document.body.classList.add('modal-open');
+      if (window.innerWidth <= 800) { botao.classList.add('hidden'); }
+    });
+  }
+  function fecharFormulario() {
+    container.style.display = 'none';
+    overlay.style.display = 'none';
+    document.body.classList.remove('modal-open');
+    botao.classList.remove('hidden');
+  }
+  if (fechar) fechar.addEventListener('click', fecharFormulario);
+  if (overlay) overlay.addEventListener('click', fecharFormulario);
+
+  // ===== Máscara de telefone na digitação =====
+  var telefoneInput = document.querySelector('input[name="telefone"]');
+  if (telefoneInput) {
+    telefoneInput.addEventListener('input', function () {
+      var v = telefoneInput.value.replace(/\D/g, '').slice(0, 11);
+      var out = '';
+      if (v.length <= 2) {
+        out = "(" + v;
+      } else {
+        var ddd = v.slice(0, 2), rest = v.slice(2);
+        if (rest.length <= 4) {
+          out = "(" + ddd + ") " + rest;
+        } else if (rest.length <= 5) {
+          out = "(" + ddd + ") " + (rest.charAt(0) === '9' ? rest.charAt(0) + " " + rest.slice(1) : rest);
+        } else {
+          var isMobile = rest.charAt(0) === '9' || rest.length > 8;
+          if (isMobile) {
+            out = "(" + ddd + ") " + rest.charAt(0) + " " + rest.slice(1, 5) + (rest.slice(5) ? "-" + rest.slice(5) : "");
+          } else {
+            out = "(" + ddd + ") " + rest.slice(0, 4) + (rest.slice(4) ? "-" + rest.slice(4) : "");
+          }
+        }
+      }
+      telefoneInput.value = out;
+    });
+  }
+
+  // ===== Erro estilizado (definido ANTES de qualquer validação usá-lo) =====
+  function mostrarErro(msg) {
+    var erro = document.getElementById('form-error');
+    if (erro) {
+      erro.textContent = msg;
+      erro.style.display = "block";
+      setTimeout(function () { erro.style.display = "none"; }, 3500);
+    } else {
+      alert(msg);
+    }
+  }
+
+  // ===== Submit =====
+  var form = document.getElementById('lead-form');
+  if (form) {
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+
+      function trim(s) { return s ? s.replace(/^\s+|\s+$/g, '') : ''; }
+
+      var nome     = trim(form.nome && form.nome.value);
+      var email    = trim(form.email && form.email.value);
+      var telefone = trim(form.telefone && form.telefone.value);
+      var empresa  = trim(form.empresa && form.empresa.value);
+      var interessePrincipal = form.interesse_principal && form.interesse_principal.value ? form.interesse_principal.value : '';
+      var telefoneLimpo = telefone.replace(/\D/g, "");
+
+      // Validação por flag: a decisão de enviar depende de um booleano,
+      // não do estilo do balão de erro.
+      var valido = true;
+      if (!nome)     { mostrarErro("Informe seu nome."); valido = false; }
+      else if (!email)   { mostrarErro("Informe seu e-mail."); valido = false; }
+      else if (!empresa) { mostrarErro("Informe o nome da sua empresa."); valido = false; }
+      else if (!interessePrincipal) { mostrarErro("Selecione o que está buscando."); valido = false; }
+      else if (telefoneLimpo.length < 10 || telefoneLimpo.length > 11) {
+        mostrarErro("Informe um telefone válido com DDD."); valido = false;
+      }
+      if (!valido) return;
+
+      var utms = getUTMParams();
+
+      // Monta o payload com dados do lead + origem.
+      var payload = {
+        nome: nome,
+        email: email,
+        telefone: telefone,
+        empresa: empresa,
+        interesse_principal: interessePrincipal
+      };
+      for (var k in utms) {
+        if (utms.hasOwnProperty(k)) { payload[k] = utms[k]; }
+      }
+
+      // Envia ao proxy server-side. O segredo do n8n mora no PHP, não aqui.
+      fetch('/wp-json/leadproxy/v1/lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).catch(function (err) { console.log("Erro webhook:", err); });
+
+      // Abre o WhatsApp com mensagem pré-preenchida.
+      var numeroWhatsApp = "NUMERO_WHATSAPP"; // ex.: 5554999999999
+      var mensagem = "Olá! Meu nome é *" + nome + "* da empresa *" + empresa + "*. Gostaria de mais informações sobre " + interessePrincipal + ".";
+      var linkWhatsApp = "https://wa.me/" + numeroWhatsApp + "?text=" + encodeURIComponent(mensagem);
+      window.open(linkWhatsApp, '_blank');
+
+      form.reset();
+      fecharFormulario();
+    });
+  }
+})();
+</script>
